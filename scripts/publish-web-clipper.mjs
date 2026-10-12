@@ -123,16 +123,19 @@ export const chromeSubmissionPlan = ({ packageVersion, status }) => {
   const submittedState = status?.submittedItemRevisionStatus?.state ?? "";
   const pending = submittedState === "PENDING_REVIEW" || submittedState === "STAGED";
 
-  if (published && compareVersions(packageVersion, published) <= 0) {
-    return { action: "already-published", published };
-  }
   if (submitted && compareVersions(packageVersion, submitted) === 0 && pending) {
     return { action: "already-submitted", published, submitted, submittedState };
   }
   if (submitted && pending) {
     return {
-      action: "waiting-review",
+      action: "blocked",
       reason: `Chrome ${submitted} is ${submittedState}. Wait for that review, or cancel it, before submitting ${packageVersion}.`,
+    };
+  }
+  if (published && compareVersions(packageVersion, published) <= 0) {
+    return {
+      action: "blocked",
+      reason: `Chrome already published ${published}. Increase apps/extension/package.json before submitting again.`,
     };
   }
   return { action: "upload", published, submitted, submittedState };
@@ -143,9 +146,6 @@ export const firefoxSubmissionPlan = ({ packageVersion, versions }) => {
   const same = listed.find((version) => version.version === packageVersion);
   if (same) {
     const status = same.file?.status ?? "";
-    if (status === "public") {
-      return { action: "already-published", version: same.version, status };
-    }
     if (status === "unreviewed" && !same.source) {
       return { action: "attach-source", version: same.version, status };
     }
@@ -158,14 +158,10 @@ export const firefoxSubmissionPlan = ({ packageVersion, versions }) => {
     };
   }
 
-  const newerPublic = listed.find((version) => version.file?.status === "public" && compareVersions(version.version, packageVersion) > 0);
-  if (newerPublic) {
-    return { action: "already-published", version: newerPublic.version, status: "public" };
-  }
   const awaiting = listed.find((version) => version.file?.status === "unreviewed");
   if (awaiting) {
     return {
-      action: "waiting-review",
+      action: "blocked",
       reason: `Firefox ${awaiting.version} is still awaiting review.`,
     };
   }
@@ -694,7 +690,7 @@ const chromeAccessToken = async (env, fetchImpl) => {
   return payload.access_token;
 };
 
-export const submitChrome = async ({ version, chromiumZip, env, fetchImpl }) => {
+const submitChrome = async ({ version, chromiumZip, env, fetchImpl }) => {
   const client = createChromeClient({
     fetchImpl,
     accessToken: await chromeAccessToken(env, fetchImpl),
@@ -733,7 +729,7 @@ export const submitChrome = async ({ version, chromiumZip, env, fetchImpl }) => 
   }
 };
 
-export const submitFirefox = async ({ version, firefoxZip, sourceZip, releaseNotes, env, fetchImpl }) => {
+const submitFirefox = async ({ version, firefoxZip, sourceZip, releaseNotes, env, fetchImpl }) => {
   const client = createFirefoxClient({
     fetchImpl,
     issuer: env.AMO_JWT_ISSUER,
@@ -748,7 +744,7 @@ export const submitFirefox = async ({ version, firefoxZip, sourceZip, releaseNot
     packageVersion: version,
     versions: await client.listVersions(),
   });
-  if (plan.action !== "upload" && plan.action !== "attach-source") {
+  if (plan.action === "blocked" || plan.action === "already-submitted") {
     return plan;
   }
   if (plan.action === "attach-source") {
@@ -792,6 +788,7 @@ const main = async () => {
   }
   if (!options.dryRun) {
     assertOfficialRepository(process.env.GITHUB_REPOSITORY);
+    assertCredentials(options.platform, process.env);
   }
 
   const version = readExtensionVersion();
@@ -826,7 +823,6 @@ const main = async () => {
   for (const platform of selectedPlatforms(options.platform)) {
     const store = platform === "chrome" ? "Chrome" : "Firefox";
     try {
-      assertCredentials(platform, process.env);
       const result = platform === "chrome"
         ? await submitChrome({ ...packages, env: process.env, fetchImpl: fetch })
         : await submitFirefox({
@@ -838,9 +834,6 @@ const main = async () => {
       results.push([store, result]);
       if (result.action === "blocked") {
         failures.push(result.reason);
-      }
-      if (result.action === "waiting-review") {
-        console.warn(`${store}: ${result.reason} Retry Submit Web Clipper with the same release_tag after review completes.`);
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -854,7 +847,6 @@ const main = async () => {
     ...results.map(([store, result]) => `${store}: ${result.action}${result.reason ? ` — ${result.reason}` : ""}`),
     "Chrome and Edge use the same Chrome Web Store submission. Review still has to approve it.",
     "Firefox review still has to approve and sign the package.",
-    "waiting-review: no package was submitted to that store. After review completes, manually rerun Submit Web Clipper with the original release_tag and that platform.",
   ].join("\n"));
   if (failures.length > 0) {
     throw new Error(failures.join(" "));
